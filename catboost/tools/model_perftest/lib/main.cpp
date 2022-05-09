@@ -15,6 +15,9 @@
 #include <util/system/hp_timer.h>
 #include <util/thread/pool.h>
 
+#include <ios>
+#include <fstream>
+
 
 struct TCMDOptions {
     TString PoolPath;
@@ -22,6 +25,7 @@ struct TCMDOptions {
     TString ModelPath;
     size_t BlockSize = Max<size_t>();
     size_t RepetitionCount = 1;
+    bool SingleBlock = false;
     int ThreadCount = 1;
 };
 
@@ -49,6 +53,7 @@ struct TTimingResult {
     }
 
     void Output(const TTimingResult* ref = nullptr) const {
+        /*
         auto myMin = Min();
         CATBOOST_INFO_LOG << "min:\t" << myMin;
         if (ref) {
@@ -62,6 +67,7 @@ struct TTimingResult {
             CATBOOST_INFO_LOG << "\t" << myMax/ref->Max();
         }
         CATBOOST_INFO_LOG << Endl;
+        */
 
         auto mymean = Mean();
         CATBOOST_INFO_LOG << "mean:\t" << mymean;
@@ -81,13 +87,14 @@ struct TTimingResult {
 };
 
 struct TResults {
-    TMap<TString, THolder<TTimingResult>> Results;
-    TString BaseResultName;
+    TMap<std::pair<int, TString>, THolder<TTimingResult>> Results;
+    std::pair<int, TString> BaseResultKey;
     TAdaptiveLock Lock;
 
-    void UpdateResult(const TString& name, double time) {
+    void UpdateResult(int priority, const TString& name, double time) {
         with_lock(Lock) {
-            auto& value = Results[name];
+            BaseResultKey = min(BaseResultKey, {-priority, name});
+            auto& value = Results[{-priority, name}];
             if (!value) {
                 value = MakeHolder<TTimingResult>();
             }
@@ -96,50 +103,45 @@ struct TResults {
     }
 
     void OutputResults() const {
+        if (!Results) {
+            return;
+        }
         NJson::TJsonValue jsonValue;
         const TTimingResult* refTimingResult = nullptr;
         CATBOOST_INFO_LOG << "name\tvalue\tdiff" << Endl;
 
-        if (BaseResultName) {
-            CATBOOST_INFO_LOG << BaseResultName << "\t" << Endl;
-            refTimingResult = Results.at(BaseResultName).Get();
-            Results.at(BaseResultName)->Output(refTimingResult);
-            jsonValue[BaseResultName] = refTimingResult->GetJsonValue();
-        }
+        refTimingResult = Results.at(BaseResultKey).Get();
         for (const auto& [key, value] : Results) {
-            if (key == BaseResultName) {
-                continue;
-            }
-            CATBOOST_INFO_LOG << key << "\t" << Endl;
+            CATBOOST_INFO_LOG << key.second << "\t" << Endl;
             value->Output(refTimingResult);
-            jsonValue[key] = value->GetJsonValue();
+            jsonValue[key.second] = value->GetJsonValue();
         }
         TFileOutput resultsFile("results.json");
         resultsFile << jsonValue.GetStringRobust();
     }
 };
 
-class TCanonData {
-public:
+struct TCanonData {
     static constexpr float Epsilon = 1e-6;
     TCanonData(size_t blockCount) {
         Results.resize(blockCount);
     }
 
-    void CheckOrSet(size_t blockId, const TVector<double>& blockResult) {
+    void CheckOrSet(const TString& name, size_t blockId, const TVector<double>& blockResult) {
         if (Results[blockId].empty()) {
             Results[blockId] = blockResult;
+            RefName = name;
         }
         const auto& ref = Results[blockId];
         CB_ENSURE(blockResult.size() == ref.size());
         for (size_t i = 0; i < blockResult.size(); ++i) {
             if(abs(blockResult[i] - ref[i]) > Epsilon) {
-                Cerr << LabeledDump(blockId, i, blockResult[i], ref[i], blockResult[i] - ref[i]) << Endl;
+                Cerr << LabeledDump(name, RefName, blockId, i, blockResult[i], ref[i], blockResult[i] - ref[i]) << Endl;
             }
         }
     }
-private:
     TVector<TVector<double>> Results;
+    TString RefName;
 };
 
 
@@ -180,6 +182,8 @@ int DoMain(int argc, char** argv) {
     parser.AddLongOption("repetitions")
         .StoreResult(&options.RepetitionCount)
         .Optional();
+    parser.AddLongOption("single-block")
+        .StoreTrue(&options.SingleBlock);
     parser.AddLongOption("threads")
         .StoreResult(&options.ThreadCount)
         .Optional();
@@ -241,7 +245,7 @@ int DoMain(int argc, char** argv) {
     options.BlockSize = Min(options.BlockSize, (size_t)dataset->GetObjectCount());
     Y_ENSURE(options.BlockSize > 0, "Empty pool");
     const size_t docsCount = dataset->GetObjectCount();
-    const size_t blockCount = (docsCount) / options.BlockSize;
+    const size_t blockCount = (options.SingleBlock ? 1 : (docsCount) / options.BlockSize);
     const size_t factorsCount = featureUsedInModel.size();
 
     CATBOOST_DEBUG_LOG << "Blocks count: " << blockCount << " block size: " << options.BlockSize << Endl;
@@ -286,10 +290,10 @@ int DoMain(int argc, char** argv) {
     TVector<double> results_vec(options.BlockSize);
     TResults results;
     TCanonData canonData(blockCount);
+    TCanonData canonDataFp16(blockCount);
     TVector<THolder<IPerftestModule>> modules;
     TSet<TPerftestModuleFactory::TKey> allRegisteredKeys;
     TPerftestModuleFactory::GetRegisteredKeys(allRegisteredKeys);
-    int biggestPriority = Min<int>();
     for (const auto& key : allRegisteredKeys) {
         try {
             auto product = TPerftestModuleFactory::Construct(key, model);
@@ -297,26 +301,58 @@ int DoMain(int argc, char** argv) {
                 continue;
             }
             modules.emplace_back(std::move(product));
-            if (modules.back()->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst) > biggestPriority) {
-                biggestPriority = modules.back()->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst);
-                results.BaseResultName = modules.back()->GetName(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst);
-            }
-            if (modules.back()->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst) > biggestPriority) {
-                biggestPriority = modules.back()->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst);
-                results.BaseResultName = modules.back()->GetName(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst);
-            }
         } catch (yexception& e) {
             Cerr << "Failed to construct module " << key << " got error: " << e.what() << Endl;
         } catch (...) {
             Cerr << "Failed to construct module " << key << " got error: " << CurrentExceptionMessage() << Endl;
         }
     }
+
+    for (auto& module : modules) {
+        if (module->SupportsLayout(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst)) {
+            auto& cn = module->GetName(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst).find("FP16") == TString::npos ? canonData : canonDataFp16;
+            for (size_t blockId = 0; blockId < blockCount; ++blockId) {
+                cn.CheckOrSet(
+                    module->GetName(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst),
+                    blockId,
+                    module->GetApplyResult(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst, nonTranspFactorsRef[blockId])
+                );
+            }
+        }
+        if (module->SupportsLayout(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst)) {
+            auto& cn = module->GetName(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst).find("FP16") == TString::npos ? canonData : canonDataFp16;
+            for (size_t blockId = 0; blockId < blockCount; ++blockId) {
+                cn.CheckOrSet(
+                    module->GetName(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst),
+                    blockId,
+                    module->GetApplyResult(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst, transpFactorsRef[blockId])
+                );
+            }
+        }
+    }
+
+    /*std::ofstream canon_output("canon_data");
+    canon_output << std::fixed << std::setprecision(100);
+    for (const auto& x : canonData.Results) {
+        for (const auto& y : x) {
+            canon_output << y << '\t';
+        }
+    }
+    canon_output << '\n';
+    for (const auto& x : canonDataFp16.Results) {
+        for (const auto& y : x) {
+            canon_output << y << '\t';
+        }
+    }
+    canon_output << '\n';*/
+
     for (size_t i = 0; i < options.RepetitionCount; ++i) {
         for (auto& module : modules) {
             if (module->SupportsLayout(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst)) {
                 if (options.ThreadCount == 1) {
                     for (size_t blockId = 0; blockId < blockCount; ++blockId) {
                         results.UpdateResult(
+                            module->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst),
                             module->GetName(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst),
                             module->Do(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst, nonTranspFactorsRef[blockId])
                         );
@@ -327,6 +363,7 @@ int DoMain(int argc, char** argv) {
                         module->Do(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst, nonTranspFactorsRef[blockId]);
                     }, 0, blockCount, NPar::TLocalExecutor::WAIT_COMPLETE);
                     results.UpdateResult(
+                        module->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst),
                         module->GetName(IPerftestModule::EPerftestModuleDataLayout::ObjectsFirst),
                         timer.Passed()
                     );
@@ -336,9 +373,10 @@ int DoMain(int argc, char** argv) {
                 if (options.ThreadCount == 1) {
                     for (size_t blockId = 0; blockId < blockCount; ++blockId) {
                         results.UpdateResult(
+                            module->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst),
                             module->GetName(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst),
-                            module->Do(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst,
-                                transpFactorsRef[blockId]));
+                            module->Do(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst, transpFactorsRef[blockId])
+                        );
                     }
                 } else {
                     THPTimer timer;
@@ -346,6 +384,7 @@ int DoMain(int argc, char** argv) {
                         module->Do(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst, transpFactorsRef[blockId]);
                     }, 0, blockCount, NPar::TLocalExecutor::WAIT_COMPLETE);
                     results.UpdateResult(
+                        module->GetComparisonPriority(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst),
                         module->GetName(IPerftestModule::EPerftestModuleDataLayout::FeaturesFirst),
                         timer.Passed()
                     );

@@ -7,4 +7,12 @@ PEERDIR(
     library/cpp/getopt
 )
 
+CFLAGS(
+    -mavx512f
+    -mavx512bw
+    -mavx512cd
+    -mavx512dq
+    -mavx512vl
+)
+
 END()

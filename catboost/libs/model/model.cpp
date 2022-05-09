@@ -16,6 +16,7 @@
 #include <catboost/private/libs/options/loss_description.h>
 #include <catboost/private/libs/options/class_label_options.h>
 
+#include <library/cpp/float16/float16.h>
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/dbg_output/dump.h>
 #include <library/cpp/dbg_output/auto.h>
@@ -613,6 +614,62 @@ void TModelTrees::CalcFirstLeafOffsets() {
             Y_ASSERT(valueNodeCount > 0);
             Y_ASSERT(maxLeafValueIndex == minLeafValueIndex + (valueNodeCount - 1) * ApproxDimension);
             ref[treeId] = minLeafValueIndex;
+        }
+    }
+}
+
+void TModelTrees::PrepareFp16Leaves() {
+    if (ApproxDimension == 1 && IsOblivious()) {
+        auto treeSizes = GetModelTreeData()->GetTreeSizes();
+        auto leaves = GetModelTreeData()->GetLeafValues();
+        const auto& origOffsets = ApplyData->TreeFirstLeafOffsets;
+
+        auto& vals = ApplyData->TreeLeafValuesFP16;
+        auto& offsets = ApplyData->TreeFirstLeafOffsetsFP16;
+        offsets.resize(treeSizes.size());
+        for (size_t treeId = 0; treeId < treeSizes.size(); ++treeId) {
+            while (vals.size() % (64 / sizeof(ui16)) != 0) {
+                vals.push_back(0);
+            }
+            offsets[treeId] = vals.size();
+            for (size_t i = 0; i < (1ull << treeSizes[treeId]); ++i) {
+                vals.push_back(TFloat16(leaves[origOffsets[treeId] + i]).Save());
+            }
+        }
+        vals.reserve(vals.size() + 64);
+        size_t add = (64 - ((uintptr_t)vals.data() % 64)) % 64 / sizeof(ui16);
+        vals.insert(vals.begin(), add, 0);
+        for (size_t treeId = 0; treeId < treeSizes.size(); ++treeId) {
+            offsets[treeId] += add;
+            CB_ENSURE((uintptr_t)(vals.data() + offsets[treeId]) % 64 == 0);
+        }
+    }
+}
+
+void TModelTrees::PrepareAlignedLeaves() {
+    if (ApproxDimension == 1 && IsOblivious()) {
+        auto treeSizes = GetModelTreeData()->GetTreeSizes();
+        auto leaves = GetModelTreeData()->GetLeafValues();
+        const auto& origOffsets = ApplyData->TreeFirstLeafOffsets;
+
+        auto& vals = ApplyData->TreeLeafValuesAligned;
+        auto& offsets = ApplyData->TreeFirstLeafOffsetsAligned;
+        offsets.resize(treeSizes.size());
+        for (size_t treeId = 0; treeId < treeSizes.size(); ++treeId) {
+            while (vals.size() % (64 / sizeof(double)) != 0) {
+                vals.push_back(0);
+            }
+            offsets[treeId] = vals.size();
+            for (size_t i = 0; i < (1ull << treeSizes[treeId]); ++i) {
+                vals.push_back(leaves[origOffsets[treeId] + i]);
+            }
+        }
+        vals.reserve(vals.size() + 64);
+        size_t add = (64 - ((uintptr_t)vals.data() % 64)) % 64 / sizeof(double);
+        vals.insert(vals.begin(), add, 0);
+        for (size_t treeId = 0; treeId < treeSizes.size(); ++treeId) {
+            offsets[treeId] += add;
+            CB_ENSURE((uintptr_t)(vals.data() + offsets[treeId]) % 64 == 0);
         }
     }
 }

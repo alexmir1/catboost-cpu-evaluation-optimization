@@ -171,6 +171,18 @@ public:
         //! Offset of first tree leaf in flat tree leafs array
         TVector<size_t> TreeFirstLeafOffsets;
 
+        //! Leaf first class values layout: Align([treeIndex])[leafId]
+        TVector<double> TreeLeafValuesAligned;
+
+        //! Offset of first tree leaf in flat tree leafs array
+        TVector<size_t> TreeFirstLeafOffsetsAligned;
+
+        //! Leaf first class values layout: Align([treeIndex])[leafId]
+        TVector<ui16> TreeLeafValuesFP16;
+
+        //! Offset of first tree leaf in flat tree leafs array
+        TVector<size_t> TreeFirstLeafOffsetsFP16;
+
         /**
          * List all unique CTR bases (feature combination + ctr type) in model
          * @return
@@ -547,6 +559,8 @@ private:
         ProcessEstimatedFeatures();
         CalcUsedModelCtrs();
         CalcFirstLeafOffsets();
+        PrepareAlignedLeaves();
+        PrepareFp16Leaves();
     }
     void CalcUsedModelCtrs();
     void CalcFirstLeafOffsets();
@@ -555,6 +569,8 @@ private:
     void ProcessTextFeatures();
     void ProcessEstimatedFeatures();
     void ProcessEmbeddingFeatures();
+    void PrepareAlignedLeaves();
+    void PrepareFp16Leaves();
 private:
     //! Number of classes in model, in most cases equals to 1.
     int ApproxDimension = 1;

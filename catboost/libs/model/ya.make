@@ -22,6 +22,20 @@ SRCS(
     utils.cpp
 )
 
+SRCS(
+    GLOBAL cpu_avx/formula_evaluator.cpp
+    cpu_avx/evaluator_impl.cpp
+    cpu_avx/quantization.cpp
+)
+
+CFLAGS(
+    -mavx512f
+    -mavx512bw
+    -mavx512cd
+    -mavx512dq
+    -mavx512vl
+)
+
 PEERDIR(
     catboost/libs/cat_feature
     catboost/private/libs/ctr_description
@@ -37,6 +51,7 @@ PEERDIR(
     library/cpp/containers/dense_hash
     library/cpp/dbg_output
     library/cpp/fast_exp
+    library/cpp/float16
     library/cpp/json
     library/cpp/object_factory
 )

@@ -18,6 +18,7 @@ public:
     virtual int GetComparisonPriority(EPerftestModuleDataLayout layout) const = 0;
     virtual bool SupportsLayout(EPerftestModuleDataLayout layout) const = 0;
     virtual double Do(EPerftestModuleDataLayout layout, TConstArrayRef<TConstArrayRef<float>> features) = 0;
+    virtual TVector<double> GetApplyResult(EPerftestModuleDataLayout layout, TConstArrayRef<TConstArrayRef<float>> features) = 0;
     virtual TString GetName(TMaybe<EPerftestModuleDataLayout> = Nothing()) const = 0;
 
     virtual ~IPerftestModule() = default;
